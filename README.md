@@ -2,6 +2,12 @@
 
 A small local demo for remixing one uploaded image into meme variants with StepFun.
 
+<p align="center">
+  <img src="./example-1.png" alt="Meme Remix Studio example 1" width="32%" />
+  <img src="./example-2.png" alt="Meme Remix Studio example 2" width="32%" />
+  <img src="./example-3.png" alt="Meme Remix Studio example 3" width="32%" />
+</p>
+
 ## Features
 
 - Upload one image and generate 2 or 4 meme variants

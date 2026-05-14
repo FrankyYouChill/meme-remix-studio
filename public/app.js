@@ -18,10 +18,17 @@ const resultCardTemplate = document.querySelector("#resultCardTemplate");
 let uploadedImage = null;
 let isGenerating = false;
 let selectedVariantText = "";
+let activeVariantRunId = 0;
+let variantStates = [];
 
 const imageEditConcurrency = 2;
 const imageEditMaxAttempts = 2;
-const retryDelayMs = 600;
+const imageEditConcurrencyForFour = 3;
+const retryDelayMs = 700;
+const retryJitterMs = 450;
+const uploadMaxDimension = 896;
+const memeIdeasClientTimeoutMs = 12000;
+const imageEditClientTimeoutMs = 32000;
 
 const presets = {
   single: [
@@ -83,8 +90,7 @@ async function prepareImageForUpload(file) {
 
   try {
     const image = await loadImage(sourceUrl);
-    const maxDimension = 1024;
-    const scale = Math.min(1, maxDimension / Math.max(image.naturalWidth, image.naturalHeight));
+    const scale = Math.min(1, uploadMaxDimension / Math.max(image.naturalWidth, image.naturalHeight));
     const width = Math.max(1, Math.round(image.naturalWidth * scale));
     const height = Math.max(1, Math.round(image.naturalHeight * scale));
 
@@ -129,16 +135,107 @@ function setStatus(message) {
   statusText.textContent = message;
 }
 
+class ApiRequestError extends Error {
+  constructor(message, options = {}) {
+    super(message);
+    this.name = "ApiRequestError";
+    this.status = options.status;
+    this.code = options.code || "request_failed";
+    this.retryable = options.retryable !== false;
+    this.requestId = options.requestId || "";
+    this.latencyMs = options.latencyMs;
+  }
+}
+
+function isRetryableStatus(status) {
+  return status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
+}
+
+function isRetryableError(error) {
+  if (error instanceof ApiRequestError) {
+    return error.retryable;
+  }
+
+  return true;
+}
+
+function friendlyErrorMessage(error) {
+  if (error instanceof ApiRequestError) {
+    if (error.code === "client_timeout" || error.code === "timeout") {
+      return "This variant timed out. Retry just this slot.";
+    }
+
+    if (error.status === 429) {
+      return "The API is rate-limiting requests. Retry this slot in a moment.";
+    }
+
+    if (error.status >= 500) {
+      return "The image API had a temporary issue. Retry this slot.";
+    }
+  }
+
+  return error instanceof Error ? error.message : "This variant failed. Retry this slot.";
+}
+
+async function fetchJsonWithTimeout(url, options, timeoutMs, label) {
+  const controller = new AbortController();
+  let didTimeout = false;
+  const startedAt = performance.now();
+  const timeout = setTimeout(() => {
+    didTimeout = true;
+    controller.abort();
+  }, timeoutMs);
+
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+    const payload = await response.json().catch(() => null);
+    const latencyMs = Math.round(performance.now() - startedAt);
+
+    if (!response.ok) {
+      throw new ApiRequestError(payload?.error || `${label} failed.`, {
+        status: response.status,
+        code: payload?.code || (response.status === 504 ? "timeout" : "upstream_error"),
+        retryable: payload?.retryable ?? isRetryableStatus(response.status),
+        requestId: payload?.requestId,
+        latencyMs: payload?.latencyMs ?? latencyMs,
+      });
+    }
+
+    return payload || {};
+  } catch (error) {
+    if (didTimeout && error?.name === "AbortError") {
+      throw new ApiRequestError(`${label} took too long.`, {
+        code: "client_timeout",
+        retryable: true,
+        latencyMs: Math.round(performance.now() - startedAt),
+      });
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function setGenerating(nextState) {
   isGenerating = nextState;
   generateButton.disabled = nextState || !uploadedImage;
+
+  if (variantStates.length) {
+    renderVariantCards();
+  }
 }
 
 function clearResults() {
+  activeVariantRunId += 1;
+  variantStates = [];
   resultsGrid.innerHTML = `
     <div class="empty-state">
       <strong>Ready for a meme sprint.</strong>
-      <span>Results will appear here when generation finishes.</span>
+      <span>Results appear one by one as each variant finishes.</span>
     </div>
   `;
   resultsGrid.classList.add("empty");
@@ -162,6 +259,174 @@ function showDebugPanel(title, payload) {
   debugCard.querySelector("strong").textContent = title;
   debugCard.querySelector("pre").textContent = JSON.stringify(payload, null, 2);
   resultsGrid.prepend(debugCard);
+}
+
+function createVariantState(index) {
+  return {
+    index,
+    label: `Variant ${index + 1}`,
+    status: "queued",
+    message: "Waiting for prompt...",
+    prompt: "",
+    caption: "",
+    imageUrl: "",
+    latencyMs: null,
+    attempts: 0,
+    retryable: false,
+    textMode: false,
+  };
+}
+
+function initializeVariantStates(count) {
+  variantStates = Array.from({ length: count }, (_, index) => createVariantState(index));
+  renderVariantCards();
+}
+
+function setVariantState(index, patch) {
+  if (!variantStates[index]) {
+    return;
+  }
+
+  variantStates[index] = {
+    ...variantStates[index],
+    ...patch,
+  };
+  renderVariantCards();
+}
+
+function renderVariantCards() {
+  if (!variantStates.length) {
+    return;
+  }
+
+  resultsGrid.classList.remove("empty");
+  resultsGrid.innerHTML = "";
+  variantStates.forEach((state) => {
+    resultsGrid.append(createVariantCard(state));
+  });
+}
+
+function createVariantCard(state) {
+  const card = document.createElement("article");
+  card.className = `result-card variant-card is-${state.status}`;
+
+  const imageWrap = document.createElement("div");
+  imageWrap.className = "result-image-wrap";
+
+  if (state.status === "done" && state.imageUrl) {
+    const image = document.createElement("img");
+    image.className = "result-image";
+    image.alt = `${state.label} result`;
+    image.src = state.imageUrl;
+    imageWrap.append(image);
+
+    const caption = document.createElement("div");
+    caption.className = "result-caption";
+    caption.textContent = state.caption || "";
+    caption.hidden = !state.caption;
+    imageWrap.append(caption);
+  } else {
+    const placeholder = document.createElement("div");
+    placeholder.className = "variant-placeholder";
+    const spinner = document.createElement("span");
+    spinner.className = "variant-spinner";
+    spinner.hidden = state.status === "failed";
+    const title = document.createElement("strong");
+    title.textContent = state.label;
+    const message = document.createElement("span");
+    message.textContent = state.message;
+
+    placeholder.append(spinner);
+    placeholder.append(title);
+    placeholder.append(message);
+    imageWrap.append(placeholder);
+  }
+
+  const meta = document.createElement("div");
+  meta.className = "result-meta variant-meta";
+
+  const status = document.createElement("span");
+  status.className = "variant-status";
+  status.textContent = variantStatusText(state);
+  meta.append(status);
+
+  if (state.status === "done" && state.imageUrl) {
+    const downloadLink = document.createElement("a");
+    downloadLink.className = "download-link";
+    downloadLink.download = `meme-remix-${state.index + 1}.png`;
+    downloadLink.href = state.imageUrl;
+    downloadLink.textContent = "Download";
+    meta.append(downloadLink);
+  }
+
+  if (state.status === "failed" && state.retryable) {
+    const retryButton = document.createElement("button");
+    retryButton.type = "button";
+    retryButton.className = "retry-button";
+    retryButton.textContent = "Retry";
+    retryButton.disabled = isGenerating;
+    retryButton.addEventListener("click", () => {
+      retryVariant(state.index);
+    });
+    meta.append(retryButton);
+  }
+
+  const details = document.createElement("details");
+  const summary = document.createElement("summary");
+  summary.textContent = state.status === "failed" ? "Failure details" : "Prompt used";
+  const promptText = document.createElement("p");
+  promptText.className = "prompt-text";
+  promptText.textContent = state.status === "failed" ? state.message : state.prompt || "Prompt pending.";
+  details.append(summary);
+  details.append(promptText);
+
+  card.append(imageWrap);
+  card.append(meta);
+  card.append(details);
+
+  return card;
+}
+
+function variantStatusText(state) {
+  if (state.status === "done") {
+    return "Ready";
+  }
+
+  if (state.status === "retrying") {
+    return `Retrying ${state.attempts}/${imageEditMaxAttempts}`;
+  }
+
+  if (state.status === "rendering") {
+    return "Rendering";
+  }
+
+  if (state.status === "failed") {
+    return state.retryable ? "Failed, retryable" : "Failed";
+  }
+
+  return "Queued";
+}
+
+function updateVariantSummary() {
+  if (!variantStates.length) {
+    return;
+  }
+
+  const total = variantStates.length;
+  const done = variantStates.filter((state) => state.status === "done").length;
+  const failed = variantStates.filter((state) => state.status === "failed").length;
+  const pending = total - done - failed;
+
+  if (pending > 0) {
+    setStatus(`Images: ${done}/${total} ready. ${pending} still rendering.`);
+    return;
+  }
+
+  setStatus(
+    failed > 0
+      ? `${done}/${total} variants ready. ${failed} failed; retry failed slots.`
+      : `${done}/${total} variants ready.`,
+  );
 }
 
 function renderPresets() {
@@ -287,8 +552,9 @@ function buildCaptionPrompt(caption) {
 
   return [
     "Keep the image composition and main subject.",
-    `Add short readable meme text: "${shortCaption}".`,
-    "Use bold white text with a black outline.",
+    `Naturally integrate the exact readable caption "${shortCaption}" into the scene.`,
+    "Choose a placement that fits the image, such as a sign, sticker, poster, screen, speech bubble, or meme text.",
+    "Keep the text crisp and readable without covering the main subject.",
   ].join(" ");
 }
 
@@ -310,10 +576,10 @@ function removeTextFreeConstraints(prompt) {
 function addTextRenderingToVariantPrompt(prompt, caption, index) {
   const shortCaption = limitText(caption, 24);
   const templates = [
-    `Add the readable meme caption "${shortCaption}" as large bold white top text with a black outline.`,
-    `Add the readable caption "${shortCaption}" near the bottom as bold meme text with strong contrast and black outline.`,
-    `Add a clean speech bubble containing exactly "${shortCaption}" with crisp readable lettering.`,
-    `Add "${shortCaption}" as a bright readable sticker-style text label, bold and centered in the composition.`,
+    `Naturally integrate the exact readable caption "${shortCaption}" into the scene as meme text that fits the composition.`,
+    `Place the exact readable caption "${shortCaption}" on an object that belongs in the image, such as a sign, poster, or screen.`,
+    `Add a clean speech bubble containing exactly "${shortCaption}" with crisp readable lettering, positioned naturally near the subject.`,
+    `Add "${shortCaption}" as a readable sticker-style detail that feels physically part of the image, not a flat overlay.`,
   ];
   const visualPrompt = removeTextFreeConstraints(prompt);
   const textPrompt = templates[index % templates.length];
@@ -363,7 +629,7 @@ function buildVariantPrompts(theme, count) {
 }
 
 async function generateCreativeVariantPrompts(theme, count) {
-  const response = await fetch("/api/meme-ideas", {
+  const payload = await fetchJsonWithTimeout("/api/meme-ideas", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -372,15 +638,19 @@ async function generateCreativeVariantPrompts(theme, count) {
       theme,
       count,
     }),
-  });
-  const payload = await response.json();
+  }, memeIdeasClientTimeoutMs, "Meme idea generation");
 
-  if (!response.ok || !Array.isArray(payload.ideas) || payload.ideas.length < count) {
+  if (!Array.isArray(payload.ideas) || payload.ideas.length < count) {
     console.error("AI creative director debug payload:", payload);
-    showDebugPanel("step-3.5-flash raw response", payload);
-    throw new Error(
+    throw new ApiRequestError(
       payload.error ||
         "step-3.5-flash did not return enough usable meme ideas. Try a more specific theme.",
+      {
+        code: payload.code || "meme_ideas_parse_error",
+        retryable: true,
+        requestId: payload.requestId,
+        latencyMs: payload.latencyMs,
+      },
     );
   }
 
@@ -392,7 +662,7 @@ async function generateCreativeVariantPrompts(theme, count) {
 
 async function editImage(prompt, seed, options = {}) {
   const startedAt = performance.now();
-  const response = await fetch("/api/edit-image", {
+  const payload = await fetchJsonWithTimeout("/api/edit-image", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -403,14 +673,9 @@ async function editImage(prompt, seed, options = {}) {
       prompt,
       seed,
       textMode: options.textMode === true,
+      variantId: options.variantId,
     }),
-  });
-
-  const payload = await response.json();
-
-  if (!response.ok) {
-    throw new Error(payload.error || "Image edit failed.");
-  }
+  }, options.timeoutMs || imageEditClientTimeoutMs, "Image edit");
 
   return {
     imageUrl: payload.imageUrl,
@@ -425,29 +690,90 @@ function wait(ms) {
   });
 }
 
-async function editImageWithRetry(item, index, total) {
+function getImageEditConcurrency(count) {
+  return count >= 4 ? imageEditConcurrencyForFour : imageEditConcurrency;
+}
+
+async function editVariantWithRetry(item, index, runId, options = {}) {
   let lastError = null;
 
   for (let attempt = 1; attempt <= imageEditMaxAttempts; attempt += 1) {
-    try {
-      const retryCopy = attempt > 1 ? ` Retrying attempt ${attempt}/${imageEditMaxAttempts}...` : "";
-      setStatus(`Generating variant ${index + 1}/${total}.${retryCopy}`);
+    if (runId !== activeVariantRunId) {
+      return null;
+    }
 
-      return await editImage(item.prompt, index + 1 + (attempt - 1) * 100, {
+    setVariantState(index, {
+      status: attempt > 1 || options.manualRetry ? "retrying" : "rendering",
+      message:
+        attempt > 1
+          ? `Retrying after a temporary issue (${attempt}/${imageEditMaxAttempts})...`
+          : "Rendering with step-image-edit-2...",
+      attempts: attempt,
+      retryable: false,
+    });
+    updateVariantSummary();
+
+    try {
+      const result = await editImage(item.prompt, index + 1 + (attempt - 1) * 100, {
         textMode: item.textMode === true,
+        timeoutMs: imageEditClientTimeoutMs,
+        variantId: `variant-${index + 1}`,
       });
+
+      if (runId !== activeVariantRunId) {
+        return null;
+      }
+
+      setVariantState(index, {
+        status: "done",
+        message: "Ready.",
+        imageUrl: result.imageUrl,
+        latencyMs: result.latencyMs,
+        prompt: result.prompt,
+        caption: item.caption || "",
+        retryable: false,
+      });
+      updateVariantSummary();
+      return result;
     } catch (error) {
       lastError = error;
       console.warn(`Variant ${index + 1} attempt ${attempt} failed:`, error);
 
-      if (attempt < imageEditMaxAttempts) {
-        setStatus(`Variant ${index + 1}/${total} failed once. Retrying...`);
-        await wait(retryDelayMs);
+      if (attempt < imageEditMaxAttempts && isRetryableError(error)) {
+        const delay = retryDelayMs + Math.round(Math.random() * retryJitterMs);
+        setVariantState(index, {
+          status: "retrying",
+          message: `${friendlyErrorMessage(error)} Retrying in ${(delay / 1000).toFixed(1)}s...`,
+          attempts: attempt + 1,
+          retryable: false,
+        });
+        await wait(delay);
+      } else {
+        break;
       }
     }
   }
 
-  throw lastError || new Error(`Variant ${index + 1} failed.`);
+  setVariantState(index, {
+    status: "failed",
+    message: friendlyErrorMessage(lastError),
+    retryable: isRetryableError(lastError),
+  });
+  updateVariantSummary();
+  return null;
+}
+
+async function retryVariant(index) {
+  const state = variantStates[index];
+
+  if (!uploadedImage || !state?.prompt || state.status === "rendering" || state.status === "retrying") {
+    return;
+  }
+
+  const runId = activeVariantRunId;
+  setGenerating(true);
+  await editVariantWithRetry(state, index, runId, { manualRetry: true });
+  setGenerating(false);
 }
 
 async function runWithConcurrency(items, concurrency, worker) {
@@ -511,8 +837,20 @@ async function generate() {
     if (mode === "variants") {
       const count = getVariantCount();
       const captionText = selectedVariantText.trim();
+      const runId = activeVariantRunId + 1;
+      activeVariantRunId = runId;
+      initializeVariantStates(count);
       setStatus(`Creating ${count} meme ideas with step-3.5-flash...`);
-      const prompts = await generateCreativeVariantPrompts(idea, count);
+      let prompts = [];
+
+      try {
+        prompts = await generateCreativeVariantPrompts(idea, count);
+      } catch (error) {
+        console.warn("Meme ideas request failed; using fast local fallback prompts:", error);
+        prompts = buildVariantPrompts(idea, count);
+        setStatus("Creative prompt request was slow, using fast local prompts...");
+      }
+
       const variantPrompts = captionText
         ? prompts.map((item, index) => ({
             ...item,
@@ -520,33 +858,40 @@ async function generate() {
             textMode: true,
           }))
         : prompts;
-      setStatus(`Generating ${variantPrompts.length} image variants with step-image-edit-2...`);
-      let successCount = 0;
-      let failedCount = 0;
+
+      variantPrompts.forEach((item, index) => {
+        setVariantState(index, {
+          label: item.label || `Variant ${index + 1}`,
+          prompt: item.prompt,
+          caption: "",
+          textMode: item.textMode === true,
+          status: "queued",
+          message: "Queued for rendering.",
+        });
+      });
+
+      const concurrency = getImageEditConcurrency(variantPrompts.length);
+      setStatus(`Rendering ${variantPrompts.length} variants with ${concurrency} parallel lanes...`);
 
       await runWithConcurrency(
         variantPrompts,
-        imageEditConcurrency,
+        concurrency,
         async (item, index) => {
-          try {
-            const result = await editImageWithRetry(item, index, variantPrompts.length);
-            successCount += 1;
-            addResultCard(result);
-            setStatus(`${successCount}/${variantPrompts.length} variants ready...`);
-          } catch (error) {
-            failedCount += 1;
-            console.error("Image variant failed:", error);
-            setStatus(
-              `${successCount}/${variantPrompts.length} variants ready. ${failedCount} failed or timed out...`,
-            );
+          if (runId !== activeVariantRunId) {
+            return;
           }
+
+          await editVariantWithRetry(
+            {
+              ...item,
+              caption: "",
+            },
+            index,
+            runId,
+          );
         },
       );
-      setStatus(
-        failedCount > 0
-          ? `${successCount} variants ready. ${failedCount} request failed or timed out.`
-          : `${successCount} variants ready.`,
-      );
+      updateVariantSummary();
       return;
     }
 

@@ -43,6 +43,42 @@ function errorDetails(error) {
   };
 }
 
+function createRequestId(prefix = "req") {
+  const safePrefix = String(prefix).replace(/[^a-z0-9_-]/gi, "").slice(0, 24) || "req";
+  return `${safePrefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function isRetryableStatus(statusCode) {
+  return statusCode === 408 || statusCode === 409 || statusCode === 425 || statusCode === 429 ||
+    statusCode >= 500;
+}
+
+function errorCodeForStatus(statusCode, fallbackCode) {
+  if (statusCode === 400) return "invalid_request";
+  if (statusCode === 401 || statusCode === 403) return "auth_error";
+  if (statusCode === 408 || statusCode === 504) return "timeout";
+  if (statusCode === 429) return "rate_limited";
+  if (statusCode >= 500) return "upstream_error";
+  return fallbackCode;
+}
+
+function upstreamErrorMessage(payload, fallback) {
+  if (payload?.error?.message) return payload.error.message;
+  if (payload?.message) return payload.message;
+  if (typeof payload?.error === "string") return payload.error;
+  return fallback;
+}
+
+function sendApiError(res, statusCode, options) {
+  sendJson(res, statusCode, {
+    error: options.error,
+    code: options.code || errorCodeForStatus(statusCode, "request_failed"),
+    retryable: options.retryable ?? isRetryableStatus(statusCode),
+    requestId: options.requestId,
+    latencyMs: options.latencyMs,
+  });
+}
+
 async function fetchJsonWithTimeout(url, options, timeoutMs, label = "Request") {
   const controller = new AbortController();
   let didTimeout = false;
@@ -382,90 +418,15 @@ function prepareMemeIdea(idea) {
   };
 }
 
-const memeAngles = [
-  "dramatic reaction",
-  "chaotic office or school situation",
-  "cinematic main character moment",
-  "unbothered disaster energy",
-  "social chaos without text",
-  "retro cinematic scene",
-  "overconfident victory lap",
-  "awkward social moment",
-];
-
-async function requestSingleMemeIdea(theme, index, total) {
-  const angle = memeAngles[(index - 1) % memeAngles.length];
-  const userPrompt = [
-    `Create exactly ONE meme image-editing idea for the theme: "${theme}".`,
-    `This is variant ${index} of ${total}. Make it a ${angle} version.`,
-    "The prompt will be sent to an image editing model with one uploaded source image.",
-    "Preserve the main subject from the source image.",
-    "CRITICAL: The image prompt must not request any visible text. No speech bubbles, chat bubbles, message bubbles, signs, labels, subtitles, captions, logos, UI text, or readable screens.",
-    "Use only body language, facial expression, props, lighting, composition, and background action to communicate the joke.",
-    "Do not use markdown. Do not return JSON. Do not include analysis or commentary.",
-    "Start your answer immediately with TITLE: and only output this format:",
-    "",
-    "TITLE: short title",
-    "PROMPT: image editing prompt under 260 characters that starts with: Keep the main subject from the image.",
-    "",
-    "Make the prompt visually specific, funny, safe for a public demo, concise, and completely text-free.",
-  ].join("\n");
-
-  const response = await fetch(`${stepApiBaseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${process.env.STEP_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "step-3.5-flash",
-      messages: [
-        {
-          role: "system",
-          content:
-            "You are a creative director for viral meme image edits. Output only one final formatted text-free visual idea. No analysis, no commentary.",
-        },
-        {
-          role: "user",
-          content: userPrompt,
-        },
-      ],
-      max_tokens: 1800,
-      stream: false,
-    }),
-  });
-  const payload = await response.json().catch(() => null);
-
-  if (!response.ok) {
-    throw new Error(payload?.error?.message || payload?.message || "StepFun chat completion failed.");
-  }
-
-  const message = payload?.choices?.[0]?.message || {};
-  const result = pickMemeIdeasFromMessage(message, 1);
-  const idea = result.ideas[0];
-
-  if (!idea) {
-    const error = new Error("Could not parse meme idea from step-3.5-flash.");
-    error.debug = {
-      raw: result.raw,
-      rawSource: result.source,
-      message,
-      variant: index,
-    };
-    throw error;
-  }
-
-  return {
-    ...prepareMemeIdea(idea),
-    source: result.source,
-    variant: index,
-  };
-}
-
 async function handleMemeIdeas(req, res) {
+  const requestId = createRequestId("ideas");
+
   if (!process.env.STEP_API_KEY) {
-    sendJson(res, 500, {
+    sendApiError(res, 500, {
       error: "Missing STEP_API_KEY. Add it to your environment before starting the server.",
+      code: "config_error",
+      retryable: false,
+      requestId,
     });
     return;
   }
@@ -476,13 +437,17 @@ async function handleMemeIdeas(req, res) {
     const count = Number(body.count) === 4 ? 4 : 2;
 
     if (!theme) {
-      sendJson(res, 400, {
+      sendApiError(res, 400, {
         error: "Theme is required.",
+        code: "invalid_request",
+        retryable: false,
+        requestId,
       });
       return;
     }
 
     logEvent("meme-ideas:start", {
+      requestId,
       model: "step-3.5-flash",
       url: `${stepChatApiBaseUrl}/chat/completions`,
       theme,
@@ -528,20 +493,25 @@ async function handleMemeIdeas(req, res) {
     );
     const latencyMs = Math.round(performance.now() - startedAt);
     logEvent("meme-ideas:response", {
+      requestId,
       status: response.status,
       latencyMs,
       ...timing,
     });
 
     if (!response.ok) {
+      const error = upstreamErrorMessage(payload, "StepFun chat completion failed.");
       logEvent("meme-ideas:error", {
+        requestId,
         status: response.status,
         latencyMs,
-        error: payload?.error?.message || payload?.message || "StepFun chat completion failed.",
+        error,
       });
-      sendJson(res, response.status, {
-        error: payload?.error?.message || payload?.message || "StepFun chat completion failed.",
-        details: payload,
+      sendApiError(res, response.status, {
+        error,
+        code: errorCodeForStatus(response.status, "meme_ideas_upstream_error"),
+        retryable: isRetryableStatus(response.status),
+        requestId,
         latencyMs,
       });
       return;
@@ -557,14 +527,16 @@ async function handleMemeIdeas(req, res) {
 
     if (generatedIdeas.length < count) {
       logEvent("meme-ideas:parse-error", {
+        requestId,
         expected: count,
         parsed: generatedIdeas.length,
         rawSource: result.source,
       });
-      sendJson(res, 502, {
+      sendApiError(res, 502, {
         error: `step-3.5-flash returned ${generatedIdeas.length}/${count} usable meme ideas.`,
-        raw: result.raw,
-        source: result.source,
+        code: "meme_ideas_parse_error",
+        retryable: true,
+        requestId,
         latencyMs,
       });
       return;
@@ -573,6 +545,7 @@ async function handleMemeIdeas(req, res) {
     generatedIdeas.sort((a, b) => a.variant - b.variant);
 
     logEvent("meme-ideas:done", {
+      requestId,
       requested: count,
       returned: generatedIdeas.slice(0, count).length,
       source: result.source,
@@ -584,22 +557,32 @@ async function handleMemeIdeas(req, res) {
       ideas: generatedIdeas.slice(0, count),
       source: result.source,
       latencyMs,
+      requestId,
     });
   } catch (error) {
     logEvent("meme-ideas:exception", {
+      requestId,
       ...errorDetails(error),
       url: `${stepChatApiBaseUrl}/chat/completions`,
     });
-    sendJson(res, error?.name === "TimeoutError" ? 504 : 500, {
+    sendApiError(res, error?.name === "TimeoutError" ? 504 : 500, {
       error: error instanceof Error ? error.message : "Unexpected server error.",
+      code: error?.name === "TimeoutError" ? "timeout" : "meme_ideas_exception",
+      retryable: true,
+      requestId,
     });
   }
 }
 
 async function handleEditImage(req, res) {
+  const requestId = createRequestId("edit");
+
   if (!process.env.STEP_API_KEY) {
-    sendJson(res, 500, {
+    sendApiError(res, 500, {
       error: "Missing STEP_API_KEY. Add it to your environment before starting the server.",
+      code: "config_error",
+      retryable: false,
+      requestId,
     });
     return;
   }
@@ -607,12 +590,16 @@ async function handleEditImage(req, res) {
   try {
     const body = await readJson(req);
     const { imageBase64, mimeType, seed } = body;
+    const variantId = String(body.variantId || "");
     const textMode = body.textMode === true;
     const prompt = limitImagePrompt(body.prompt);
 
     if (!imageBase64 || !prompt) {
-      sendJson(res, 400, {
+      sendApiError(res, 400, {
         error: "Both imageBase64 and prompt are required.",
+        code: "invalid_request",
+        retryable: false,
+        requestId,
       });
       return;
     }
@@ -620,6 +607,8 @@ async function handleEditImage(req, res) {
     const imageBuffer = base64ToBuffer(imageBase64);
 
     logEvent("image-edit:start", {
+      requestId,
+      variantId,
       model: "step-image-edit-2",
       seed: seed ?? 1,
       textMode,
@@ -660,6 +649,8 @@ async function handleEditImage(req, res) {
     );
     const latencyMs = Math.round(performance.now() - startedAt);
     logEvent("image-edit:response", {
+      requestId,
+      variantId,
       status: response.status,
       latencyMs,
       ...timing,
@@ -667,14 +658,19 @@ async function handleEditImage(req, res) {
     });
 
     if (!response.ok) {
+      const error = upstreamErrorMessage(payload, "StepFun API request failed.");
       logEvent("image-edit:error", {
+        requestId,
+        variantId,
         status: response.status,
         latencyMs,
-        error: payload?.error?.message || payload?.message || "StepFun API request failed.",
+        error,
       });
-      sendJson(res, response.status, {
-        error: payload?.error?.message || payload?.message || "StepFun API request failed.",
-        details: payload,
+      sendApiError(res, response.status, {
+        error,
+        code: errorCodeForStatus(response.status, "image_edit_upstream_error"),
+        retryable: isRetryableStatus(response.status),
+        requestId,
         latencyMs,
       });
       return;
@@ -684,19 +680,25 @@ async function handleEditImage(req, res) {
 
     if (!resultBase64) {
       logEvent("image-edit:error", {
+        requestId,
+        variantId,
         status: 502,
         latencyMs,
         error: "StepFun API did not return a b64_json image.",
       });
-      sendJson(res, 502, {
+      sendApiError(res, 502, {
         error: "StepFun API did not return a b64_json image.",
-        details: payload,
+        code: "missing_image_output",
+        retryable: true,
+        requestId,
         latencyMs,
       });
       return;
     }
 
     logEvent("image-edit:done", {
+      requestId,
+      variantId,
       latencyMs,
       seed: seed ?? 1,
       outputChars: resultBase64.length,
@@ -705,13 +707,18 @@ async function handleEditImage(req, res) {
     sendJson(res, 200, {
       imageUrl: `data:image/png;base64,${resultBase64}`,
       latencyMs,
+      requestId,
     });
   } catch (error) {
     logEvent("image-edit:exception", {
+      requestId,
       ...errorDetails(error),
     });
-    sendJson(res, error?.name === "TimeoutError" ? 504 : 500, {
+    sendApiError(res, error?.name === "TimeoutError" ? 504 : 500, {
       error: error instanceof Error ? error.message : "Unexpected server error.",
+      code: error?.name === "TimeoutError" ? "timeout" : "image_edit_exception",
+      retryable: true,
+      requestId,
     });
   }
 }
