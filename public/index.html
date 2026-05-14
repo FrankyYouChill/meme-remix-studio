@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Meme Remix Studio</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark">M</span>
+          <span>Meme Remix Studio</span>
+        </div>
+        <div class="model-pill">step-image-edit-2</div>
+      </header>
+
+      <section class="hero">
+        <div>
+          <p class="eyebrow">AI image editing demo</p>
+          <h1>Meme Remix Studio</h1>
+          <p class="hero-copy">
+            Upload any image, type a joke, and turn it into shareable memes in seconds.
+          </p>
+        </div>
+        <div class="proof">
+          <span>Fast edits</span>
+          <span>Batch variants</span>
+          <span>Text rendering</span>
+        </div>
+      </section>
+
+      <section class="workspace">
+        <aside class="panel controls">
+          <label class="upload-card" for="imageInput">
+            <input id="imageInput" type="file" accept="image/png,image/jpeg,image/webp" />
+            <span class="upload-icon">+</span>
+            <span class="upload-title">Drop in your source image</span>
+            <span class="upload-copy">PNG, JPG, or WEBP. Keep it under 8MB for the prototype.</span>
+          </label>
+
+          <div id="previewWrap" class="preview-wrap is-empty">
+            <img id="previewImage" alt="Uploaded preview" />
+            <p>No image selected yet.</p>
+          </div>
+
+          <div class="field">
+            <label for="modeSelect">Demo mode</label>
+            <select id="modeSelect">
+              <option value="single">Speed edit test</option>
+              <option value="variants">Generate meme variants</option>
+              <option value="caption">Caption/Text rendering challenge</option>
+            </select>
+          </div>
+
+          <div class="field compact-field" id="variantCountField">
+            <label for="variantCount">Number of variants</label>
+            <select id="variantCount">
+              <option value="2" selected>2 variants</option>
+              <option value="4">4 variants</option>
+            </select>
+          </div>
+
+          <div class="field" id="ideaField">
+            <label id="ideaLabel" for="ideaInput">Meme idea</label>
+            <textarea id="ideaInput" rows="4">Make this a dramatic reaction meme about shipping a demo five minutes before launch.</textarea>
+          </div>
+
+          <div class="preset-row" id="presetRow"></div>
+
+          <button id="generateButton" class="primary-button">Generate meme</button>
+          <p id="statusText" class="status">Add an image to start.</p>
+        </aside>
+
+        <section class="panel results-panel">
+          <div class="results-header">
+            <div>
+              <p class="eyebrow">Generation canvas</p>
+              <h2 id="resultsTitle">Your remixes</h2>
+            </div>
+            <button id="clearButton" class="ghost-button">Clear</button>
+          </div>
+
+          <div id="resultsGrid" class="results-grid empty">
+            <div class="empty-state">
+              <strong>Ready for a meme sprint.</strong>
+              <span>Results will appear here when generation finishes.</span>
+            </div>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <template id="resultCardTemplate">
+      <article class="result-card">
+        <div class="result-image-wrap">
+          <img class="result-image" alt="Generated meme result" />
+          <div class="result-caption"></div>
+        </div>
+        <div class="result-meta">
+          <a class="download-link" download="meme-remix.png">Download</a>
+        </div>
+        <details>
+          <summary>Prompt used</summary>
+          <p class="prompt-text"></p>
+        </details>
+      </article>
+    </template>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
